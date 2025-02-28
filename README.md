@@ -10,17 +10,11 @@ Ce serveur implémente le protocole MCP (Model Context Protocol) pour Cursor, pe
 ## Installation et démarrage
 
 1. Clonez ce dépôt
-2. Exécutez le script de connexion pour Cursor:
+2. Démarrez le serveur avec Docker Compose:
 
 ```bash
-./cursor-connect.sh
+docker-compose up -d
 ```
-
-Le script effectuera automatiquement les actions suivantes:
-
-- Suppression de tout conteneur MCP existant avec le même nom
-- Création d'un nouveau conteneur dédié à Cursor
-- Connexion à la base de données PostgreSQL
 
 ## Configuration dans Cursor
 
@@ -29,7 +23,7 @@ Le script effectuera automatiquement les actions suivantes:
 3. Ajoutez une nouvelle connexion avec les paramètres suivants:
    - Nom: MCP Postgres Server
    - Type: command
-   - Commande: `./cursor-connect.sh`
+   - Commande: `docker exec -i mcp-postgres-server node dist/index.js`
 
 ## Résolution des problèmes
 
@@ -38,13 +32,13 @@ Si le serveur ne démarre pas correctement:
 1. Vérifiez les logs du conteneur:
 
    ```bash
-   docker logs mcp-postgres-server-cursor
+   docker logs mcp-postgres-server
    ```
 
-2. Pour redémarrer le serveur, il suffit de relancer le script:
+2. Pour redémarrer le serveur:
 
    ```bash
-   ./cursor-connect.sh
+   docker-compose restart
    ```
 
 ## Fonctionnalités du serveur MCP

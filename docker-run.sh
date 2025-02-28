@@ -32,7 +32,6 @@ show_usage() {
   echo "  stop        Stop and remove the container"
   echo "  logs        View container logs"
   echo "  restart     Restart the container"
-  echo "  cursor      Start a separate container for Cursor"
   echo "  build       Rebuild the Docker image"
   echo "  exec        Execute a command inside the container (e.g., './docker-run.sh exec \"node dist/index.js\"')"
   echo "  run         Run the server directly (shortcut for exec with node dist/index.js)"
@@ -59,29 +58,6 @@ case "$1" in
     echo "Restarting MCP PostgreSQL Server..."
     docker-compose restart
     echo "Container restarted."
-    ;;
-  cursor)
-    echo "Starting a separate container for Cursor..."
-    # Load environment variables
-    export $(grep -v '^#' .env | xargs)
-    
-    # Configuration
-    DB_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@host.docker.internal:5432/${POSTGRES_DB}"
-    CONTAINER_NAME="mcp-postgres-server-cursor"
-    IMAGE_NAME="mcp-postgres-server-mcp-server"
-    
-    # Remove existing container if it exists
-    if docker ps -a | grep -q $CONTAINER_NAME; then
-      echo "Removing existing Cursor container..."
-      docker rm -f $CONTAINER_NAME > /dev/null 2>&1
-    fi
-    
-    # Run the container
-    echo "Starting Cursor container..."
-    docker run -i --rm --name $CONTAINER_NAME \
-      -e DATABASE_URL="$DB_URL" \
-      --add-host=host.docker.internal:host-gateway \
-      $IMAGE_NAME
     ;;
   exec)
     if [ -z "$2" ]; then

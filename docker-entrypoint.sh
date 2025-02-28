@@ -17,6 +17,9 @@ cleanup() {
 # Set up signal trapping
 trap cleanup SIGTERM SIGINT
 
+# This script is used for the main container, not for direct Cursor connections
+# For Cursor, use: docker exec -i mcp-postgres-server node dist/index.js
+
 # Start the MCP server
 if [ -n "$DATABASE_URL" ]; then
   echo "Using DATABASE_URL from environment: $(echo $DATABASE_URL | sed 's/:[^:]*@/:***@/')"
