@@ -1,5 +1,12 @@
 #!/usr/bin/env node
 
+/**
+ * PostgreSQL MCP Server
+ * 
+ * This server provides a Model Context Protocol interface to PostgreSQL databases,
+ * allowing LLMs to execute read-only queries and explore database schemas.
+ */
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -21,24 +28,23 @@ import dotenv from "dotenv";
  * This ensures Claude can be properly instructed about all available functionality.
  */
 
+// Load environment variables early
+dotenv.config();
+
 // Configuration constants
-const DEBUG = true;
+const DEBUG = process.env.DEBUG === "true";
 const API_TIMEOUT_MS = 30000; // 30 second timeout for API calls
-const HEARTBEAT_INTERVAL_MS = 10000; // 10 second heartbeat interval
-const SHUTDOWN_GRACE_PERIOD_MS = 5000; // 5 second grace period for shutdown
-const MAX_RECONNECT_ATTEMPTS = 3;
-const RECONNECT_DELAY_MS = 2000;
+const HEARTBEAT_INTERVAL_MS = 5000; // 5 second heartbeat interval
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAY_MS = 1000;
 
 // Connection state tracking
 const connectionState = {
   isConnected: false,
   reconnectAttempts: 0,
   lastHeartbeat: Date.now(),
+  isShuttingDown: false,
 };
-
-// Load environment variables
-dotenv.config();
-debugLog("Environment variables loaded");
 
 // Utility functions
 function debugLog(...args: any[]) {
@@ -73,11 +79,10 @@ async function withTimeout<T>(
   context: string
 ): Promise<T> {
   try {
-    const result = (await Promise.race([
+    return await Promise.race([
       promise,
       createTimeout(timeoutMs, context),
-    ])) as T;
-    return result;
+    ]) as T;
   } catch (error: any) {
     if (error?.message?.includes("Timeout after")) {
       debugLog(`Operation timed out: ${context}`);
@@ -86,18 +91,37 @@ async function withTimeout<T>(
   }
 }
 
-// Parse command line arguments
-const args = process.argv.slice(2);
-if (args.length === 0) {
-  console.error("Please provide a database URL as a command-line argument");
-  process.exit(1);
-}
+debugLog("Environment variables loaded");
 
-const databaseUrl = args[0];
+// Get database URL from environment variable or command line arguments
+let databaseUrl: string;
+
+// First check if DATABASE_URL environment variable is set
+if (process.env.DATABASE_URL) {
+  databaseUrl = process.env.DATABASE_URL;
+  debugLog("Using DATABASE_URL from environment variable");
+} else {
+  // Fall back to command line arguments
+  const args = process.argv.slice(2);
+  if (args.length === 0) {
+    console.error("Please provide a database URL as a command-line argument or set DATABASE_URL environment variable");
+    process.exit(1);
+  }
+  databaseUrl = args[0];
+  debugLog("Using database URL from command line argument");
+}
 
 // Create a pool for database connections
 const pool = new pg.Pool({
   connectionString: databaseUrl,
+  max: 20, // Maximum number of clients in the pool
+  idleTimeoutMillis: 30000, // How long a client is allowed to remain idle before being closed
+  connectionTimeoutMillis: 5000, // How long to wait for a connection to become available
+});
+
+// Add event listeners to the pool for better error handling
+pool.on('error', (err: Error) => {
+  handleError(err, "Unexpected error on idle client");
 });
 
 // Create the MCP server with explicit capabilities
@@ -130,6 +154,22 @@ const server = new McpServer({
 
 debugLog("MCP server created");
 
+// Helper function for database operations with proper error handling
+async function executeDbQuery<T>(
+  queryFn: (client: pg.PoolClient) => Promise<T>,
+  errorContext: string
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    return await queryFn(client);
+  } catch (error) {
+    handleError(error, errorContext);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 // Add PostgreSQL tools with improved error handling
 server.tool(
   "postgres_query",
@@ -140,34 +180,31 @@ server.tool(
     try {
       debugLog("Executing SQL query:", params.sql);
       
-      const client = await pool.connect();
-      try {
+      return await executeDbQuery(async (client) => {
         await client.query("BEGIN TRANSACTION READ ONLY");
-        const result = await withTimeout(
-          client.query(params.sql),
-          API_TIMEOUT_MS,
-          "Executing SQL query"
-        );
-        
-        debugLog(`Query executed successfully, returned ${result.rows.length} rows`);
-        
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(result.rows, null, 2),
-            },
-          ],
-        };
-      } catch (error) {
-        handleError(error, "Failed to execute SQL query");
-        throw error;
-      } finally {
-        client
-          .query("ROLLBACK")
-          .catch((error) => console.warn("Could not roll back transaction:", error));
-        client.release();
-      }
+        try {
+          const result = await withTimeout(
+            client.query(params.sql),
+            API_TIMEOUT_MS,
+            "Executing SQL query"
+          ) as pg.QueryResult;
+          
+          debugLog(`Query executed successfully, returned ${result.rows.length} rows`);
+          
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(result.rows, null, 2),
+              },
+            ],
+          };
+        } finally {
+          client
+            .query("ROLLBACK")
+            .catch((error: Error) => console.warn("Could not roll back transaction:", error));
+        }
+      }, "Failed to execute SQL query");
     } catch (error) {
       handleError(error, "Failed to execute SQL query");
       throw error;
@@ -182,19 +219,18 @@ server.tool(
     try {
       debugLog("Listing database tables");
       
-      const client = await pool.connect();
-      try {
+      return await executeDbQuery(async (client) => {
         const result = await withTimeout(
           client.query(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
           ),
           API_TIMEOUT_MS,
           "Listing database tables"
-        );
+        ) as pg.QueryResult;
         
         debugLog(`Found ${result.rows.length} tables`);
         
-        const tableList = result.rows.map((row) => row.table_name);
+        const tableList = result.rows.map((row: { table_name: string }) => row.table_name);
         
         return {
           content: [
@@ -204,12 +240,7 @@ server.tool(
             },
           ],
         };
-      } catch (error) {
-        handleError(error, "Failed to list database tables");
-        throw error;
-      } finally {
-        client.release();
-      }
+      }, "Failed to list database tables");
     } catch (error) {
       handleError(error, "Failed to list database tables");
       throw error;
@@ -226,8 +257,7 @@ server.tool(
     try {
       debugLog("Describing table:", params.tableName);
       
-      const client = await pool.connect();
-      try {
+      return await executeDbQuery(async (client) => {
         const result = await withTimeout(
           client.query(
             "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_name = $1",
@@ -235,7 +265,7 @@ server.tool(
           ),
           API_TIMEOUT_MS,
           `Describing table ${params.tableName}`
-        );
+        ) as pg.QueryResult;
         
         debugLog(`Table description retrieved with ${result.rows.length} columns`);
         
@@ -258,12 +288,7 @@ server.tool(
             },
           ],
         };
-      } catch (error) {
-        handleError(error, `Failed to describe table ${params.tableName}`);
-        throw error;
-      } finally {
-        client.release();
-      }
+      }, `Failed to describe table ${params.tableName}`);
     } catch (error) {
       handleError(error, `Failed to describe table ${params.tableName}`);
       throw error;
@@ -271,75 +296,13 @@ server.tool(
   }
 );
 
-// Create and configure transport
-const transport = new StdioServerTransport();
-
-transport.onerror = async (error: any) => {
-  handleError(error, "Transport error");
-  if (connectionState.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-    connectionState.reconnectAttempts++;
-    debugLog(
-      `Attempting reconnection (${connectionState.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`
-    );
-    setTimeout(async () => {
-      try {
-        await server.connect(transport);
-        connectionState.isConnected = true;
-        debugLog("Reconnection successful");
-      } catch (reconnectError) {
-        handleError(reconnectError, "Reconnection failed");
-        if (connectionState.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-          debugLog("Max reconnection attempts reached, shutting down");
-          await shutdown();
-        }
-      }
-    }, RECONNECT_DELAY_MS);
-  } else {
-    debugLog("Max reconnection attempts reached, shutting down");
-    await shutdown();
-  }
-};
-
-transport.onmessage = async (message: any) => {
-  try {
-    debugLog("Received message:", message?.method);
-
-    if (message?.method === "initialize") {
-      debugLog("Handling initialize request");
-      connectionState.isConnected = true;
-      connectionState.lastHeartbeat = Date.now();
-    } else if (message?.method === "initialized") {
-      debugLog("Connection fully initialized");
-      connectionState.isConnected = true;
-    } else if (message?.method === "server/heartbeat") {
-      connectionState.lastHeartbeat = Date.now();
-      debugLog("Heartbeat received");
-    }
-
-    // Set up heartbeat check
-    const heartbeatCheck = setInterval(() => {
-      const timeSinceLastHeartbeat = Date.now() - connectionState.lastHeartbeat;
-      if (timeSinceLastHeartbeat > HEARTBEAT_INTERVAL_MS * 2) {
-        debugLog("No heartbeat received, attempting reconnection");
-        clearInterval(heartbeatCheck);
-        if (transport && transport.onerror) {
-          transport.onerror(new Error("Heartbeat timeout"));
-        }
-      }
-    }, HEARTBEAT_INTERVAL_MS);
-
-    // Clear heartbeat check on process exit
-    process.on("beforeExit", () => {
-      clearInterval(heartbeatCheck);
-    });
-  } catch (error) {
-    handleError(error, "Message handling error");
-    throw error;
-  }
-};
-
 // Handle graceful shutdown
 const shutdown = async () => {
+  if (connectionState.isShuttingDown) {
+    return; // Prevent multiple shutdown attempts
+  }
+  
+  connectionState.isShuttingDown = true;
   debugLog("Shutting down gracefully...");
 
   // Close database pool
@@ -361,6 +324,84 @@ const shutdown = async () => {
   process.exit(0);
 };
 
+// Create and configure transport
+const transport = new StdioServerTransport();
+
+// Define message type for better type safety
+interface McpMessage {
+  method?: string;
+  params?: any;
+  id?: string | number;
+}
+
+transport.onerror = async (error: any) => {
+  handleError(error, "Transport error");
+  if (connectionState.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+    connectionState.reconnectAttempts++;
+    debugLog(
+      `Attempting reconnection (${connectionState.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`
+    );
+    setTimeout(async () => {
+      try {
+        await server.connect(transport);
+        connectionState.isConnected = true;
+        connectionState.reconnectAttempts = 0; // Reset counter on successful reconnection
+        debugLog("Reconnection successful");
+      } catch (reconnectError) {
+        handleError(reconnectError, "Reconnection failed");
+        if (connectionState.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+          debugLog("Max reconnection attempts reached, shutting down");
+          await shutdown();
+        }
+      }
+    }, RECONNECT_DELAY_MS);
+  } else {
+    debugLog("Max reconnection attempts reached, shutting down");
+    await shutdown();
+  }
+};
+
+transport.onmessage = async (message: McpMessage) => {
+  try {
+    debugLog("Received message:", message?.method);
+
+    if (message?.method === "initialize") {
+      debugLog("Handling initialize request");
+      connectionState.isConnected = true;
+      connectionState.lastHeartbeat = Date.now();
+    } else if (message?.method === "initialized") {
+      debugLog("Connection fully initialized");
+      connectionState.isConnected = true;
+    } else if (message?.method === "server/heartbeat") {
+      connectionState.lastHeartbeat = Date.now();
+      debugLog("Heartbeat received");
+    }
+  } catch (error) {
+    handleError(error, "Message handling error");
+    throw error;
+  }
+};
+
+// Set up heartbeat check
+const heartbeatCheck = setInterval(() => {
+  if (!connectionState.isConnected) {
+    return; // Skip check if not connected
+  }
+  
+  const timeSinceLastHeartbeat = Date.now() - connectionState.lastHeartbeat;
+  if (timeSinceLastHeartbeat > HEARTBEAT_INTERVAL_MS * 2) {
+    debugLog("No heartbeat received, attempting reconnection");
+    if (transport && transport.onerror) {
+      transport.onerror(new Error("Heartbeat timeout"));
+    }
+  }
+}, HEARTBEAT_INTERVAL_MS);
+
+// Clear heartbeat check on process exit
+process.on("beforeExit", () => {
+  clearInterval(heartbeatCheck);
+});
+
 // Update signal handlers
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
@@ -376,33 +417,44 @@ process.on("unhandledRejection", (reason: any, promise: Promise<any>) => {
   shutdown();
 });
 
-// Verify database connection before starting server
-try {
-  debugLog("Verifying database connection...");
-  const client = await pool.connect();
-  client.release();
-  debugLog("Database connection verified");
-} catch (error) {
-  handleError(error, "Failed to verify database connection");
-  process.exit(1);
+// Main startup function to coordinate initialization
+async function startServer() {
+  // Verify database connection before starting server
+  try {
+    debugLog("Verifying database connection...");
+    const client = await pool.connect();
+    client.release();
+    debugLog("Database connection verified");
+  } catch (error) {
+    handleError(error, "Failed to verify database connection");
+    process.exit(1);
+  }
+
+  // Connect to transport with initialization handling
+  try {
+    debugLog("Connecting to MCP transport...");
+    await server.connect(transport);
+    debugLog("MCP server connected and ready");
+  } catch (error) {
+    handleError(error, "Failed to connect MCP server");
+    process.exit(1);
+  }
+
+  // Keep the process alive and handle errors
+  process.stdin.resume();
+  process.stdin.on("error", (error: Error) => {
+    handleError(error, "stdin error");
+  });
+
+  process.stdout.on("error", (error: Error) => {
+    handleError(error, "stdout error");
+  });
+  
+  debugLog("Server startup complete");
 }
 
-// Connect to transport with initialization handling
-try {
-  debugLog("Connecting to MCP transport...");
-  await server.connect(transport);
-  debugLog("MCP server connected and ready");
-} catch (error) {
-  handleError(error, "Failed to connect MCP server");
+// Start the server
+startServer().catch(error => {
+  handleError(error, "Unexpected error during server startup");
   process.exit(1);
-}
-
-// Keep the process alive and handle errors
-process.stdin.resume();
-process.stdin.on("error", (error) => {
-  handleError(error, "stdin error");
-});
-
-process.stdout.on("error", (error) => {
-  handleError(error, "stdout error");
 }); 
